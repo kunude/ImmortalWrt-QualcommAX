@@ -1,0 +1,358 @@
+diff --git a/patches/feeds/edma-nss/luci/0001-status-connections-show-nss-dscp-class.patch b/patches/feeds/edma-nss/luci/0001-status-connections-show-nss-dscp-class.patch
+new file mode 100644
+index 0000000000..43795af922
+--- /dev/null
++++ b/patches/feeds/edma-nss/luci/0001-status-connections-show-nss-dscp-class.patch
+@@ -0,0 +1,52 @@
++luci-mod-status: show the NSS QoS DSCP class on the connections page
++
++The nssqos service records each marked connection's DSCP class in the
++conntrack mark as (dscp | 0x80). getConntrackList already surfaces the
++mark, so decode it into a DSCP column on Status -> Realtime -> Connections.
++This replaces the separate NSS connections viewer the image used to ship.
++
++Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
++--- a/modules/luci-mod-status/htdocs/luci-static/resources/view/status/connections.js
+++++ b/modules/luci-mod-status/htdocs/luci-static/resources/view/status/connections.js
++@@ -54,6 +54,22 @@
++ 
++ const recheck_lookup_queue = {};
++ 
+++/* NSS QoS (package nssqos) records a connection's DSCP class in the conntrack
+++ * mark as (dscp | 0x80), qosmate-compatible. Decode it so accelerated flows
+++ * show their class here — the mark rides in the getConntrackList payload. */
+++const NSS_DSCP_NAMES = {
+++	0:'CS0', 8:'CS1', 16:'CS2', 24:'CS3', 32:'CS4', 40:'CS5', 48:'CS6', 56:'CS7',
+++	10:'AF11', 12:'AF12', 14:'AF13', 18:'AF21', 20:'AF22', 22:'AF23',
+++	26:'AF31', 28:'AF32', 30:'AF33', 34:'AF41', 36:'AF42', 38:'AF43',
+++	46:'EF', 44:'VA', 1:'LE'
+++};
+++function nssDscpLabel(mark) {
+++	const m = +mark || 0;
+++	if (!(m & 0x80)) return '-';
+++	const d = m & 0x7f;
+++	return NSS_DSCP_NAMES[d] || ('0x' + d.toString(16));
+++}
+++
++ Math.log2 = Math.log2 || function(x) { return Math.log(x) * Math.LOG2E; };
++ 
++ return view.extend({
++@@ -194,7 +210,7 @@
++ 							}
++ 					}
++ 
++-					rows.push([network, protocol, source, destination, transfer]);
+++					rows.push([network, protocol, source, destination, transfer, nssDscpLabel(c.mark)]);
++ 			}
++ 
++ 			cbi_update_table('#connections', rows, E('em', _('No information available')));
++@@ -511,7 +527,8 @@
++ 							E('th', { 'class': 'th col-2' }, [ _('Protocol') ]),
++ 							E('th', { 'class': 'th col-7' }, [ _('Source') ]),
++ 							E('th', { 'class': 'th col-7' }, [ _('Destination') ]),
++-							E('th', { 'class': 'th col-4' }, [ _('Transfer') ])
+++							E('th', { 'class': 'th col-4' }, [ _('Transfer') ]),
+++							E('th', { 'class': 'th col-2' }, [ _('DSCP') ])
++ 						]),
++ 						E('tr', { 'class': 'tr placeholder' }, [
++ 							E('td', { 'class': 'td' }, [
+diff --git a/patches/feeds/ppe/packages/0001-sqm-scripts-pin-the-fork-that-carries-hw_ppe.patch b/patches/feeds/ppe/packages/0001-sqm-scripts-pin-the-fork-that-carries-hw_ppe.patch
+new file mode 100644
+index 0000000000..071db447fc
+--- /dev/null
++++ b/patches/feeds/ppe/packages/0001-sqm-scripts-pin-the-fork-that-carries-hw_ppe.patch
+@@ -0,0 +1,35 @@
++sqm-scripts: pin the fork that carries the hw_ppe script
++
++hw_ppe.qos drives the PPE port shaper and its bulk queue from the SQM
++config, and exists only in the sqm-scripts fork - upstream sqm-scripts has
++no hardware backend. The pin is the tip of the fork's hw-ppe-offload
++branch, rebased onto upstream v1.8.0 so it carries the nftables marking
++the feed now builds against, and it pairs with the qca_ppe driver on
++ppe-offload: the driver serves priorities eight and up from a
++schedulable band of their own, and the script shapes only the download
++into it, so local traffic between switch ports runs at line rate.
++
++PKG_VERSION names a release upstream has not made, so the fork's tarball
++never shares a download name with the one the unpatched feed fetches.
++
++Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
++--- a/net/sqm-scripts/Makefile
+++++ b/net/sqm-scripts/Makefile
++@@ -8,13 +8,13 @@
++ include $(TOPDIR)/rules.mk
++ 
++ PKG_NAME:=sqm-scripts
++-PKG_SOURCE_VERSION:=77cf89e82ced9b215cc02f64fd471f5278b7d031
++-PKG_VERSION:=1.8.0
+++PKG_SOURCE_VERSION:=a9c7b6dbd95d9bc652905b7bdd10839c08b2c14e
+++PKG_VERSION:=1.8.3
++ PKG_RELEASE:=1
++ 
++ PKG_SOURCE_PROTO:=git
++-PKG_SOURCE_URL:=https://github.com/tohojo/sqm-scripts
++-PKG_MIRROR_HASH:=65322cd90305838d6aab49b433e37b4601b603184bfe2442bee6c996d2bf7ade
+++PKG_SOURCE_URL:=https://github.com/JuliusBairaktaris/sqm-scripts
+++PKG_MIRROR_HASH:=skip
++ 
++ PKG_MAINTAINER:=Toke Høiland-Jørgensen <toke@toke.dk>
++ PKG_LICENSE:=GPL-2.0-only
+diff --git a/target/linux/qualcommax/base-files/etc/config/nss_freq b/target/linux/qualcommax/base-files/etc/config/nss_freq
+new file mode 100644
+index 0000000000..06e2be01b0
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/etc/config/nss_freq
+@@ -0,0 +1,2 @@
++config nss_freq 'settings'
++	option level 'mid'
+diff --git a/target/linux/qualcommax/base-files/etc/init.d/nss_freq b/target/linux/qualcommax/base-files/etc/init.d/nss_freq
+new file mode 100644
+index 0000000000..295d25956a
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/etc/init.d/nss_freq
+@@ -0,0 +1,16 @@
++#!/bin/sh /etc/rc.common
++
++START=95
++
++start() {
++	local level
++
++	config_load nss_freq
++	config_get level settings level mid
++	case "$level" in
++		mid|high) ;;
++		*) level=mid ;;
++	esac
++
++	/usr/bin/nss_freq "$level" >/dev/null 2>&1
++}
+diff --git a/target/linux/qualcommax/base-files/etc/init.d/set-irq-affinity b/target/linux/qualcommax/base-files/etc/init.d/set-irq-affinity
+new file mode 100644
+index 0000000000..775be70529
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/etc/init.d/set-irq-affinity
+@@ -0,0 +1,37 @@
++#!/bin/sh /etc/rc.common
++
++START=99
++
++get_cpu_mask() {
++	local cpu range start end mask=0
++
++	for range in $(tr ',' ' ' < /sys/devices/system/cpu/online 2> /dev/null); do
++		start="${range%-*}"
++		end="${range#*-}"
++		[ "$start" = "$end" ] && end="$start"
++
++		for cpu in $(seq "$start" "$end"); do
++			mask=$((mask | (1 << cpu)))
++		done
++	done
++
++	[ "$mask" -gt 0 ] || mask=1
++	printf '%x' "$mask"
++}
++
++start() {
++	local flow_cnt sock_flow_entries cpu_mask
++
++	flow_cnt=8192
++	sock_flow_entries=65535
++	cpu_mask="$(get_cpu_mask)"
++
++	for eth in $(jsonfilter -i "/etc/board.json" -e "@.network[*].device"); do
++		[ -d "/sys/class/net/$eth" ] || continue
++		for i in "/sys/class/net/$eth"/queues/rx-*/rps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
++		for i in "/sys/class/net/$eth"/queues/rx-*/rps_flow_cnt; do [ -w "$i" ] && echo "$flow_cnt" > "$i"; done
++		for i in "/sys/class/net/$eth"/queues/tx-*/xps_cpus; do [ -w "$i" ] && echo "$cpu_mask" > "$i"; done
++	done
++
++	[ -w "/proc/sys/net/core/rps_sock_flow_entries" ] && echo "$sock_flow_entries" > "/proc/sys/net/core/rps_sock_flow_entries"
++}
+diff --git a/target/linux/qualcommax/base-files/etc/uci-defaults/15_nss_cleanup.sh b/target/linux/qualcommax/base-files/etc/uci-defaults/15_nss_cleanup.sh
+new file mode 100644
+index 0000000000..26c3aa7fb7
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/etc/uci-defaults/15_nss_cleanup.sh
+@@ -0,0 +1,10 @@
++#!/bin/sh
++
++rm -f \
++	/etc/config/ecm \
++	/etc/config/nss \
++	/etc/config/pbuf \
++	/etc/config/skb_recycler \
++	/etc/config/smp_affinity
++
++exit 0
+diff --git a/target/linux/qualcommax/base-files/etc/uci-defaults/991_set-network.sh b/target/linux/qualcommax/base-files/etc/uci-defaults/991_set-network.sh
+new file mode 100644
+index 0000000000..cd6e601594
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/etc/uci-defaults/991_set-network.sh
+@@ -0,0 +1,34 @@
++#!/bin/sh
++
++# 检查 network.globals.ula_prefix 是否存在且不为空
++ula_prefix=$(uci get network.globals.ula_prefix 2>/dev/null)
++
++if [ -n "$ula_prefix" ]; then
++	uci set dhcp.wan6=dhcp
++	uci set dhcp.wan6.interface='wan6'
++	uci set dhcp.wan6.ignore='1'
++
++	uci set dhcp.lan.force='1'
++	uci set dhcp.lan.ra='hybrid'
++	uci set dhcp.lan.ra_default='1'
++	uci set dhcp.lan.max_preferred_lifetime='1800'
++	uci set dhcp.lan.max_valid_lifetime='3600'
++
++	uci del dhcp.lan.dhcpv6
++	uci del dhcp.lan.ra_flags
++	uci del dhcp.lan.ra_slaac
++	uci add_list dhcp.lan.ra_flags='none'
++
++	uci commit dhcp
++
++	uci set network.wan6.reqaddress='try'
++	uci set network.wan6.reqprefix='auto'
++	uci set network.lan.ip6assign='64'
++	uci set network.lan.ip6ifaceid='eui64'
++	uci set network.globals.packet_steering='0'
++	uci del network.globals.ula_prefix
++
++	uci commit network
++fi
++
++exit 0
+diff --git a/target/linux/qualcommax/base-files/etc/uci-defaults/999-QOL_config b/target/linux/qualcommax/base-files/etc/uci-defaults/999-QOL_config
+new file mode 100644
+index 0000000000..b52da1de4c
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/etc/uci-defaults/999-QOL_config
+@@ -0,0 +1,39 @@
++# This file ships in the image, so it runs again after every
++# settings-preserving sysupgrade. Apply the opinionated defaults once and
++# record that, or a user who changed any of them gets them silently reset on
++# their next upgrade.
++# The marker lives in uci because /etc/config is preserved across sysupgrade;
++# clear it to have these defaults applied again.
++[ "$(uci -q get system.@system[0].qol_defaults)" = 1 ] && exit 0
++
++uci -q batch << EOI
++
++# Wireless defaults live in the static /etc/config/wireless (configured from
++# the first boot - no detection race - but disabled until the user sets a key).
++
++# Firewall settings
++set firewall.@zone[1].input='DROP'
++
++# Network settings (BCP38 anti-spoofing on WAN).
++set bcp38.cfg018e45.enabled='1'
++set bcp38.cfg018e45.interface='wan'
++
++# NTP: serve time locally (sysntpd) and advertise this router to LAN clients
++# via DHCP option 42 (which carries IP addresses, not hostnames). The address
++# is derived from the live LAN config, not hardcoded.
++set system.ntp.enable_server='1'
++
++# uHTTPd settings
++set uhttpd.main.redirect_https='1'
++
++EOI
++
++# DHCP option 42 needs the router's actual LAN address - derive it from the
++# live config (uci-defaults run after the board defaults exist). add_list does
++# not deduplicate, so check for an existing option 42 first.
++lan_ip=$(uci -q get network.lan.ipaddr)
++[ -n "$lan_ip" ] && ! uci -q get dhcp.lan.dhcp_option | tr ' ' '\n' | grep -q '^42,' \
++	&& uci -q add_list dhcp.lan.dhcp_option="42,${lan_ip%%/*}"
++
++uci -q set system.@system[0].qol_defaults='1'
++exit 0
+diff --git a/target/linux/qualcommax/base-files/usr/bin/nss_freq b/target/linux/qualcommax/base-files/usr/bin/nss_freq
+new file mode 100644
+index 0000000000..70a738ec2f
+--- /dev/null
++++ b/target/linux/qualcommax/base-files/usr/bin/nss_freq
+@@ -0,0 +1,79 @@
++#!/bin/sh
++
++clock_dir=/proc/sys/dev/nss/clock
++current_freq="$clock_dir/current_freq"
++auto_scale="$clock_dir/auto_scale"
++compatible=/proc/device-tree/compatible
++
++die() {
++	echo "nss_freq: $*" >&2
++	exit 1
++}
++
++format_frequency() {
++	case "$1" in
++		''|*[!0-9]*) echo "Unknown" ;;
++		*) awk -v hz="$1" 'BEGIN { printf "%.1f MHz", hz / 1000000 }' ;;
++	esac
++}
++
++show_status() {
++	status_current="$(cat "$current_freq" 2>/dev/null)" || die "NSS frequency control is unavailable"
++	status_scale="$(cat "$auto_scale" 2>/dev/null)" || die "NSS frequency mode is unavailable"
++	case "$status_scale" in
++		1) status_mode="Auto" ;;
++		0) status_mode="Fixed" ;;
++		*) status_mode="Unknown" ;;
++	esac
++
++	echo "NSS MODE: $status_mode"
++	echo "NSS FREQ: $(format_frequency "$status_current")"
++}
++
++select_frequencies() {
++	[ -r "$compatible" ] || die "device-tree compatible data is unavailable"
++
++	if grep -q 'qcom,ipq6018' "$compatible"; then
++		mid_frequency=748800000
++		high_frequency=1497600000
++	elif grep -q 'qcom,ipq8074' "$compatible"; then
++		mid_frequency=748800000
++		high_frequency=1689600000
++	else
++		die "unsupported platform"
++	fi
++}
++
++save_level() {
++	[ "$(uci -q get nss_freq.settings.level)" = "$level" ] && return
++
++	uci -q set nss_freq.settings=nss_freq || die "failed to save NSS frequency level"
++	uci -q set nss_freq.settings.level="$level" || die "failed to save NSS frequency level"
++	uci -q commit nss_freq || die "failed to save NSS frequency level"
++}
++
++case "${1:-status}" in
++	status)
++		show_status
++		exit 0
++		;;
++	mid|high)
++		level="$1"
++		;;
++	*)
++		echo "Usage: nss_freq {mid|high|status}" >&2
++		exit 2
++		;;
++esac
++
++select_frequencies
++[ -w "$current_freq" ] || die "run as root after the NSS driver has initialized"
++
++case "$level" in
++	mid) target_frequency=$mid_frequency ;;
++	high) target_frequency=$high_frequency ;;
++esac
++
++printf '%s\n' "$target_frequency" > "$current_freq" || die "failed to set NSS frequency"
++save_level
++show_status

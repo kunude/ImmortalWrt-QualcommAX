@@ -1,0 +1,1592 @@
+diff --git a/package/emortal/luci-app-fullconenat-sonic/Makefile b/package/emortal/luci-app-fullconenat-sonic/Makefile
+new file mode 100644
+index 0000000000..c328a2b311
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/Makefile
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++include $(TOPDIR)/rules.mk
++
++PKG_NAME:=luci-app-fullconenat-sonic
++PKG_VERSION:=20260917
++PKG_RELEASE:=13
++PKG_PO_VERSION:=$(PKG_VERSION)-r$(PKG_RELEASE)
++PKG_LICENSE:=GPL-2.0-only
++
++LUCI_TITLE:=LuCI support for SONiC full cone NAT
++LUCI_DEPENDS:=@LINUX_6_18 @(PACKAGE_firewall4||PACKAGE_firewall) +fullconenat-sonic luci-app-firewall
++LUCI_DEFAULT:=y if PACKAGE_luci-app-firewall && (PACKAGE_firewall4 || PACKAGE_firewall)
++LUCI_PKGARCH:=all
++
++# Extend the feed's current zone form without maintaining a second copy of it.
++PKG_FILE_DEPENDS:=$(TOPDIR)/feeds/luci/applications/luci-app-firewall/htdocs/luci-static/resources/view/firewall/zones.js
++
++define Build/Prepare/luci-app-fullconenat-sonic
++	$(INSTALL_DIR) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/view/firewall
++	$(CP) $(PKG_FILE_DEPENDS) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/view/firewall/zones-sonic.js
++endef
++
++include $(TOPDIR)/feeds/luci/luci.mk
++
++# call BuildPackage - OpenWrt buildroot signature
+diff --git a/package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js b/package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js
+new file mode 100644
+index 0000000000..cc5d32390c
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js
+@@ -0,0 +1,56 @@
++'use strict';
++'require baseclass';
++'require form';
++'require uci';
++
++function syncMasquerading(before) {
++	for (const zone of uci.sections('firewall', 'zone')) {
++		const sid = zone['.name'];
++		// A user's IPv4 mask-off choice takes priority within the same save.
++		if (before[sid]?.masq === '1' && uci.get('firewall', sid, 'masq') !== '1')
++			uci.set('firewall', sid, 'fullcone', '0');
++		else if (before[sid]?.fullcone !== '1' && uci.get('firewall', sid, 'fullcone') === '1')
++			uci.set('firewall', sid, 'masq', '1');
++	}
++}
++
++return baseclass.extend({
++	attach(map) {
++		const save = map.save.bind(map);
++		map.save = function(cb, silent) {
++			// Read each option through get(): sections() retains deleted options.
++			const before = Object.fromEntries(uci.sections('firewall', 'zone').map(zone => {
++				const sid = zone['.name'];
++				return [ sid, {
++					masq: uci.get('firewall', sid, 'masq'),
++					fullcone: uci.get('firewall', sid, 'fullcone')
++				} ];
++			}));
++			return save(() => {
++				for (const defaults of uci.sections('firewall', 'defaults')) {
++					uci.set('firewall', defaults['.name'], 'flow_offloading', '0');
++					uci.set('firewall', defaults['.name'], 'flow_offloading_hw', '0');
++				}
++				syncMasquerading(before);
++				return cb ? cb() : undefined;
++			}, silent);
++		};
++	},
++
++	addGlobal(section) {
++		const o = section.option(form.Flag, 'fullcone', _('Fullcone NAT'));
++		o.default = '1';
++		o.rmempty = false;
++		return o;
++	},
++
++	addZone(section) {
++		const o = section.taboption('general', form.Flag, 'fullcone', _('Fullcone NAT'),
++			_('Uses all supported protocols. Enabling Fullcone NAT automatically enables IPv4 masquerading. Disabling IPv4 masquerading also disables Fullcone NAT for this zone. Disabling Fullcone NAT leaves masquerading unchanged. IPv6 masquerading is independent. Usually enable this only on the WAN zone.'));
++		o.editable = true;
++		o.default = '0';
++		o.rmempty = false;
++		section.addModalOptions = modal => this.attach(modal.map);
++		return o;
++	}
++});
+diff --git a/package/emortal/luci-app-fullconenat-sonic/patches/001-integrate-firewall-zones.patch b/package/emortal/luci-app-fullconenat-sonic/patches/001-integrate-firewall-zones.patch
+new file mode 100644
+index 0000000000..5d0068c6f2
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/patches/001-integrate-firewall-zones.patch
+@@ -0,0 +1,40 @@
++--- a/htdocs/luci-static/resources/view/firewall/zones-sonic.js
+++++ b/htdocs/luci-static/resources/view/firewall/zones-sonic.js
++@@ -6,6 +6,7 @@
++ 'require network';
++ 'require firewall';
++ 'require tools.firewall as fwtool';
+++'require tools.fullconenat-sonic as fullcone';
++ 'require tools.widgets as widgets';
++ 
++ return view.extend({
++@@ -35,6 +36,7 @@ return view.extend({
++ 
++ 		m = new form.Map('firewall', _('Firewall - Zone Settings'),
++ 			_('The firewall creates zones over your network interfaces to control network traffic flow.'));
+++		fullcone.attach(m);
++ 
++ 		s = m.section(form.TypedSection, 'defaults', _('General Settings'));
++ 		s.anonymous = true;
++@@ -55,11 +57,7 @@ return view.extend({
++ 		};
++ 
++ 		o = s.option(form.Flag, 'drop_invalid', _('Drop invalid packets'));
++-		if (L.hasSystemFeature('fullcone')) {
++-			o = s.option(form.Flag, 'fullcone', _('Enable FullCone NAT'));
++-			if (fw4)
++-				o = s.option(form.Flag, 'fullcone6', _('Enable FullCone NAT6'));
++-		}
+++		fullcone.addGlobal(s);
++ 
++ 		let p = [
++ 			s.option(form.ListValue, 'input', _('Input', 'firewall input')),
++@@ -184,6 +182,8 @@ return view.extend({
++ 			return null;
++ 		};
++ 
+++		fullcone.addZone(s);
+++
++ 		o = s.taboption('general', form.Flag, 'mtu_fix', _('MSS clamping'));
++ 		o.modalonly = true;
++ 
+diff --git a/package/emortal/luci-app-fullconenat-sonic/patches/002-disable-routing-nat-offload.patch b/package/emortal/luci-app-fullconenat-sonic/patches/002-disable-routing-nat-offload.patch
+new file mode 100644
+index 0000000000..e86c3b2571
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/patches/002-disable-routing-nat-offload.patch
+@@ -0,0 +1,37 @@
++--- a/htdocs/luci-static/resources/view/firewall/zones-sonic.js
+++++ b/htdocs/luci-static/resources/view/firewall/zones-sonic.js
++@@ -71,34 +71,6 @@ return view.extend({
++ 			popt.value('ACCEPT', _('accept'));
++ 		}
++ 
++-		/* Netfilter flow offload support */
++-
++-		if (L.hasSystemFeature('offloading')) {
++-			s = m.section(form.TypedSection, 'defaults', _('Routing/NAT Offloading'),
++-				_('Not fully compatible with QoS/SQM.'));
++-
++-			s.anonymous = true;
++-			s.addremove = false;
++-
++-			o = s.option(form.RichListValue, "offloading_type", _("Flow offloading type"));
++-			o.value('0', _("None"));
++-			o.value('1', _("Software flow offloading"), _('Software based offloading for routing/NAT.'));
++-			o.value('2', _("Hardware flow offloading"), _('Hardware based offloading for routing with/without NAT.') + ' ' + _(' Requires hardware NAT support.'));
++-			o.optional = false;
++-			o.load = function (section_id) {
++-				const flow_offloading = uci.get('firewall', section_id, 'flow_offloading');
++-				const flow_offloading_hw = uci.get('firewall', section_id, 'flow_offloading_hw');
++-				return (flow_offloading === '1')
++-					? (flow_offloading_hw === '1' ? '2' : '1')
++-					: '0';
++-			};
++-			o.write = function(section_id, value) {
++-				uci.set('firewall', section_id, 'flow_offloading', value === '0' ? null : '1');
++-				uci.set('firewall', section_id, 'flow_offloading_hw', value === '2' ? '1' : null);
++-			};
++-		}
++-
++-
++ 		s = m.section(form.GridSection, 'zone', _('Zones'));
++ 		s.addremove = true;
++ 		s.anonymous = true;
+diff --git a/package/emortal/luci-app-fullconenat-sonic/po/templates/fullconenat-sonic.pot b/package/emortal/luci-app-fullconenat-sonic/po/templates/fullconenat-sonic.pot
+new file mode 100644
+index 0000000000..40f3fd4ca5
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/po/templates/fullconenat-sonic.pot
+@@ -0,0 +1,19 @@
++msgid ""
++msgstr "Content-Type: text/plain; charset=UTF-8"
++
++#: package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js:37
++#: package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js:44
++msgid "Fullcone NAT"
++msgstr ""
++
++#: package/emortal/luci-app-fullconenat-sonic/root/usr/share/rpcd/acl.d/luci-app-fullconenat-sonic.json:3
++msgid "Grant access to fullcone firewall settings"
++msgstr ""
++
++#: package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js:45
++msgid ""
++"Uses all supported protocols. Enabling Fullcone NAT automatically enables "
++"IPv4 masquerading. Disabling IPv4 masquerading also disables Fullcone NAT "
++"for this zone. Disabling Fullcone NAT leaves masquerading unchanged. IPv6 "
++"masquerading is independent. Usually enable this only on the WAN zone."
++msgstr ""
+diff --git a/package/emortal/luci-app-fullconenat-sonic/po/zh_Hans/fullconenat-sonic.po b/package/emortal/luci-app-fullconenat-sonic/po/zh_Hans/fullconenat-sonic.po
+new file mode 100644
+index 0000000000..bbd29d0c40
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/po/zh_Hans/fullconenat-sonic.po
+@@ -0,0 +1,21 @@
++msgid ""
++msgstr ""
++"Content-Type: text/plain; charset=UTF-8\n"
++"Language: zh_Hans\n"
++
++#: package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js:37
++#: package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js:44
++msgid "Fullcone NAT"
++msgstr "全锥型 NAT"
++
++#: package/emortal/luci-app-fullconenat-sonic/root/usr/share/rpcd/acl.d/luci-app-fullconenat-sonic.json:3
++msgid "Grant access to fullcone firewall settings"
++msgstr "授予访问全锥型防火墙设置的权限"
++
++#: package/emortal/luci-app-fullconenat-sonic/htdocs/luci-static/resources/tools/fullconenat-sonic.js:45
++msgid ""
++"Uses all supported protocols. Enabling Fullcone NAT automatically enables "
++"IPv4 masquerading. Disabling IPv4 masquerading also disables Fullcone NAT "
++"for this zone. Disabling Fullcone NAT leaves masquerading unchanged. IPv6 "
++"masquerading is independent. Usually enable this only on the WAN zone."
++msgstr "使用所有受支持的协议。开启全锥型 NAT 时自动开启 IPv4 伪装；关闭 IPv4 伪装时自动关闭该区域的全锥型 NAT。关闭全锥型 NAT 不改变伪装设置。IPv6 伪装保持独立。通常仅需在 WAN 区域开启。"
+diff --git a/package/emortal/luci-app-fullconenat-sonic/root/etc/uci-defaults/90-luci-app-fullconenat-sonic b/package/emortal/luci-app-fullconenat-sonic/root/etc/uci-defaults/90-luci-app-fullconenat-sonic
+new file mode 100644
+index 0000000000..497f122a2f
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/root/etc/uci-defaults/90-luci-app-fullconenat-sonic
+@@ -0,0 +1,56 @@
++#!/bin/sh
++
++# Migrate legacy fields and initialize defaults once at installation.
++# The standard uci-defaults runner removes this script after success.
++# Preserve NAT choices; disable flow offloading and remove obsolete snapshots.
++. /lib/functions.sh
++
++migrate_legacy() {
++	local section="$1"
++	if [ "$(uci -q get "firewall.$section.fullcone6")" = 1 ] &&
++	   [ "$(uci -q get "firewall.$section.fullcone")" != 1 ]; then
++		uci set "firewall.$section.fullcone=1" || exit 1
++	fi
++	if uci -q get "firewall.$section.fullcone6" >/dev/null; then
++		uci -q delete "firewall.$section.fullcone6" || exit 1
++	fi
++}
++
++init_defaults() {
++	uci set "firewall.$1.flow_offloading=0" || exit 1
++	uci set "firewall.$1.flow_offloading_hw=0" || exit 1
++	uci -q get "firewall.$1.fullcone" >/dev/null ||
++		uci set "firewall.$1.fullcone=1" || exit 1
++}
++
++init_zone() {
++	local section="$1" name
++	if uci -q get "firewall.$section.fullcone_proto" >/dev/null; then
++		uci -q delete "firewall.$section.fullcone_proto" || exit 1
++	fi
++	config_get name "$section" name
++	[ -n "$name" ] || return 0
++
++	if [ "$name" = wan ]; then
++		uci -q get "firewall.$section.fullcone" >/dev/null ||
++			uci set "firewall.$section.fullcone=1" || exit 1
++	fi
++
++	[ "$(uci -q get 'firewall.@defaults[0].fullcone')" = 1 ] || return 0
++	[ "$(uci -q get "firewall.$section.fullcone")" = 1 ] || return 0
++
++	uci set "firewall.$section.masq=1" || exit 1
++}
++
++config_load firewall
++config_foreach migrate_legacy
++config_foreach init_defaults defaults
++config_foreach init_zone zone
++uci commit firewall || exit 1
++
++# This configuration only held restore snapshots, which are no longer used.
++rm -f "${UCI_CONFIG_DIR:-/etc/config}/fullconenat_sonic" \
++	"${UCI_CONFIG_DIR:-/etc/config}/fullconenat_sonic.apk-new" \
++	"${UCI_CONFIG_DIR:-/etc/config}/fullconenat_sonic.apk-save" || exit 1
++
++exit 0
+diff --git a/package/emortal/luci-app-fullconenat-sonic/root/usr/share/luci/menu.d/luci-app-fullconenat-sonic.json b/package/emortal/luci-app-fullconenat-sonic/root/usr/share/luci/menu.d/luci-app-fullconenat-sonic.json
+new file mode 100644
+index 0000000000..7196813fd8
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/root/usr/share/luci/menu.d/luci-app-fullconenat-sonic.json
+@@ -0,0 +1,12 @@
++{
++	"admin/network/firewall/zones": {
++		"action": {
++			"type": "view",
++			"path": "firewall/zones-sonic"
++		},
++		"depends": {
++			"acl": [ "luci-app-firewall", "luci-app-fullconenat-sonic" ],
++			"uci": { "firewall": true }
++		}
++	}
++}
+diff --git a/package/emortal/luci-app-fullconenat-sonic/root/usr/share/rpcd/acl.d/luci-app-fullconenat-sonic.json b/package/emortal/luci-app-fullconenat-sonic/root/usr/share/rpcd/acl.d/luci-app-fullconenat-sonic.json
+new file mode 100644
+index 0000000000..217ab83ba3
+--- /dev/null
++++ b/package/emortal/luci-app-fullconenat-sonic/root/usr/share/rpcd/acl.d/luci-app-fullconenat-sonic.json
+@@ -0,0 +1,7 @@
++{
++	"luci-app-fullconenat-sonic": {
++		"description": "Grant access to fullcone firewall settings",
++		"read": { "uci": [ "firewall" ] },
++		"write": { "uci": [ "firewall" ] }
++	}
++}
+diff --git a/package/network/config/firewall4/Makefile b/package/network/config/firewall4/Makefile
+index 78ea51a8b4..3f4acd06a0 100644
+--- a/package/network/config/firewall4/Makefile
++++ b/package/network/config/firewall4/Makefile
+@@ -23,7 +23,7 @@ define Package/firewall4
+   TITLE:=OpenWrt 4th gen firewall
+   DEPENDS:= \
+ 	+kmod-nft-core +kmod-nft-fib +kmod-nft-offload \
+-	+kmod-nft-nat +kmod-nft-fullcone \
++	+kmod-nft-nat +fullconenat-sonic \
+ 	+nftables-json \
+ 	+ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci
+   EXTRA_DEPENDS:=ucode (>=2022.03.22)
+diff --git a/package/network/utils/fullconenat-sonic/Makefile b/package/network/utils/fullconenat-sonic/Makefile
+new file mode 100644
+index 0000000000..8eb3f5ed93
+--- /dev/null
++++ b/package/network/utils/fullconenat-sonic/Makefile
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++include $(TOPDIR)/rules.mk
++
++PKG_NAME:=fullconenat-sonic
++PKG_VERSION:=20260917
++PKG_RELEASE:=6
++
++PKG_URL:=https://github.com/mufeng05/openwrt-sonic-fullcone
++SONIC_SOURCE_VERSION:=4de0643f6b48e7e7d57d768144204ce5d3078c8f
++SONIC_LEGACY_PACKAGES:=kmod-nft-fullcone kmod-ipt-fullconenat iptables-mod-fullconenat ip6tables-mod-fullconenat
++PKG_LICENSE:=GPL-2.0-only
++
++include $(INCLUDE_DIR)/package.mk
++
++define Package/fullconenat-sonic
++  SECTION:=net
++  CATEGORY:=Network
++  SUBMENU:=Firewall
++  TITLE:=SONiC full cone NAT support for firewall3/firewall4
++  URL:=$(PKG_URL)
++  DEPENDS:=@LINUX_6_18 +kmod-nft-nat
++  CONFLICTS:=$(SONIC_LEGACY_PACKAGES)
++  # APK packaging does not emit CONFLICTS; reject all legacy package versions.
++  EXTRA_DEPENDS:=$(if $(CONFIG_USE_APK),$(foreach pkg,$(SONIC_LEGACY_PACKAGES),!$(pkg) (>=0)$(comma)))
++  KCONFIG:=CONFIG_NF_NAT_FULLCONE=y CONFIG_NF_CT_PROTO_UDPLITE=y CONFIG_NF_CT_PROTO_SCTP=y
++  PKGARCH:=all
++endef
++
++define Package/fullconenat-sonic/description
++ SONiC full cone NAT integrated into nf_nat, nft_masq and xt_MASQUERADE,
++ with global, per-zone and per-protocol firewall3/firewall4 settings.
++ Requires a kernel built with the SONiC kernel patches.
++endef
++
++# These patches target the LuCI feed and are applied before package scanning.
++define Build/Compile
++endef
++
++define Package/fullconenat-sonic/install
++	$(INSTALL_DIR) $(1)/usr/share/fullconenat-sonic
++	echo '$(SONIC_SOURCE_VERSION)' > $(1)/usr/share/fullconenat-sonic/version
++endef
++
++$(eval $(call BuildPackage,fullconenat-sonic))
+diff --git a/package/network/utils/fullconenat-sonic/README.md b/package/network/utils/fullconenat-sonic/README.md
+new file mode 100644
+index 0000000000..73180ea614
+--- /dev/null
++++ b/package/network/utils/fullconenat-sonic/README.md
+@@ -0,0 +1,180 @@
++# fullconenat-sonic
++
++firewall3/iptables and fw4/nftables integration based on [openwrt-sonic-fullcone](https://github.com/mufeng05/openwrt-sonic-fullcone),
++revision `4de0643f6b48e7e7d57d768144204ce5d3078c8f` (2026-09-17), with local
++mapping reservation and policy isolation fixes. The fw3/iptables target and
++the fw4/nftables expression are compiled into the existing NAT modules.
++
++## Build and UI
++
++On Linux 6.18, either `firewall` (fw3) or `firewall4` (fw4) selects
++`fullconenat-sonic`. The backend and its UI are restricted to Linux 6.18.
++The kernel code is part of `nf_nat.ko`, `nft_masq.ko` and
++`xt_MASQUERADE.ko`, with no separate fullcone kernel module. The package
++enables UDP-Lite and SCTP conntrack support through its own `KCONFIG` metadata.
++
++Cross-component patches use their standard build locations:
++
++- `target/linux/generic/hack-6.18/984-*-sonic-*.patch`: NAT core.
++- `target/linux/generic/hack-6.18/985-*-sonic-*.patch`: iptables target.
++- `target/linux/generic/hack-6.18/986-*-sonic-*.patch`: nft expression.
++- `package/network/utils/iptables/patches/901-*.patch`: `libxt_NAT` target.
++- `package/network/config/firewall/patches/001-sonic-fullcone.patch`: fw3 rules.
++- `package/libs/libnftnl/patches/001-*.patch`: expression encoding.
++- `package/network/utils/nftables/patches/002-*.patch`: nft syntax.
++- `package/network/config/firewall4/patches/001-sonic-fullcone.patch` and
++  `002-default-enable-fullcone.patch`: rule generation and defaults.
++- `package/network/config/firewall4/patches/003-match-nat-leakage-address-family.patch`:
++  only emit NAT leakage protection for masqueraded address families, so turning
++  off one family's masquerading cannot conflict with a zone's subnet matches.
++
++Kernel patches use the generic kernel stack. LuCI integration patches apply only
++to the copied view in the UI package build directory; no global metadata hook
++or writable Git feed checkout is required.
++
++The separate `package/emortal/luci-app-fullconenat-sonic` package owns the LuCI
++integration, ACL and translations for both firewall generations, using the
++standard `htdocs/`, `root/` and `po/` layout and the feed's `luci.mk`.
++The optional `luci-app-fullconenat-sonic` package is selected by default
++when `luci-app-firewall` is enabled. The settings appear in **Network →
++Firewall → General Settings**: the global switch follows **Drop invalid
++packets**, and the zone switch follows **IPv4 Masquerading** in both the
++zone table and its add/edit dialog. No separate tab is added. At build time,
++the package copies the current feed zone form and applies a small integration
++patch, keeping the standard LuCI zone controls. Its menu entry selects that
++extended view at the existing `firewall/zones` route. The original firewall
++package files remain owned by `luci-app-firewall`. Headless builds do not
++require the UI package.
++The standard LuCI build generates `luci-i18n-fullconenat-sonic-zh-cn` and
++selects it when Simplified Chinese is enabled in the LuCI language options.
++Translation compilation, installation and post-install cache refresh use
++the common LuCI rules; no custom translation or refresh commands are needed.
++The copied view removes legacy fullcone controls and uses the SONiC helper.
++The original feed and its feature probe remain unchanged.
++
++Both legacy `fullconenat-nft` and `fullconenat` source packages are removed.
++The package rejects installation alongside their old binary packages.
++For APK builds this is also encoded as negative dependencies, since this
++tree's APK packer does not translate `CONFLICTS` into package metadata.
++`CONFIG_NF_NAT_FULLCONE` enables the SONiC core and frontends through normal
++kernel package metadata. When disabled, the extra endpoint table, conntrack
++fields, locks and reservation scans are compiled out.
++
++Build the kernel together with the packages. Installing the small
++userspace package alone cannot add this feature to a different kernel.
++
++## Configuration
++
++Fullcone requires `defaults.fullcone=1`, `zone.fullcone=1`, and `zone.masq=1`
++for IPv4 or (with fw4) `zone.masq6=1` for IPv6. Fresh configurations enable the global
++switch and WAN zone, with software/hardware firewall flow offloading disabled.
++The LuCI package also resets both offload flags to `0` on installation and
++saving the form, and hides the Routing/NAT Offloading section. This does not
++change the separate Qualcomm NSS/ECM configuration. The base firewall
++configuration enables IPv4 masquerading; installing the LuCI package never
++changes IPv6 masquerading. Enable it independently when IPv6 NAT is needed.
++
++```uci
++config defaults
++        option fullcone '1'
++
++config zone
++        option name 'wan'
++        list network 'wan'
++        list network 'wan6'
++        option masq '1'
++        option fullcone '1'
++```
++
++Fullcone always uses all supported protocols: TCP, UDP, UDP-Lite and SCTP.
++There is no protocol selector in LuCI or UCI. The install migration removes
++obsolete `fullcone_proto` lists. Other protocols and connections managed by a
++NAT helper retain ordinary NAT semantics. fw4 groups the four protocols into
++one set per direction and address family; fw3 emits one rule per protocol.
++
++Mapping creation respects `masq_src` and `masq_dest`. New remote peers can
++reach an existing fullcone mapping without a destination restriction;
++ordinary NAT bindings are not exposed by that lookup. Explicit port
++forwards run first. The default translated port range is `1024-65535`.
++The kernel also checks endpoint reservations when no range is supplied.
++If the nft expression or range attributes are unavailable, fw4 disables
++fullcone and generates ordinary masquerade rules. fw3 uses the `FULLCONE`
++iptables target in both PREROUTING and POSTROUTING, and probes its kernel
++availability before generating rules. fw3 itself generates IPv4 masquerade
++only. Its UI reflects that scope. The iptables target supports both families;
++IPv6 rules can be added with `ip6tables` and `kmod-ipt-nat6`:
++
++```sh
++ip6tables -t nat -A POSTROUTING -o wan -p udp -j FULLCONE --to-ports 1024-65535
++ip6tables -t nat -A PREROUTING -i wan -p udp -j FULLCONE
++```
++
++Replace `wan` with the actual interface and place explicit DNAT rules first.
++On fw3, the `FULLCONE` target is included in the existing `libiptext` library;
++no separate iptables extension package is needed.
++The nft expression supports `ip`, `ip6` and `inet` NAT tables, including
++JSON rule import/export through the patched nftables package.
++
++Existing firewall configurations remain under package-manager conffile
++handling. Upgrades from the old global-only switch require enabling the
++zone switch. The LuCI package carries a one-time uci-defaults migration that
++maps an enabled legacy `fullcone6` value to `fullcone` when needed and then
++removes the obsolete option; the normal settings page has no legacy fallback.
++The integrated form and its add/edit dialogs use the standard staged save/apply
++flow. Enabling a zone's Fullcone NAT enables IPv4 masquerading. Turning off
++IPv4 masquerading also disables the
++corresponding zone's Fullcone NAT when saving, preserving that mask-off choice.
++IPv6 masquerading and other zones are unaffected. Enabling IPv4 masquerading alone does not enable
++Fullcone NAT. Disabling a zone's Fullcone NAT or the global switch leaves the
++current masquerading settings unchanged; no restore snapshots are kept.
++New zones include the switch, initially off. The same one-time migration script
++enables the global and WAN switches only if absent, enables IPv4 masquerading for
++active zones, and removes the obsolete fullconenat_sonic snapshot configuration.
++The normal form only reads and writes the firewall configuration.
++
++## Mapping and offload behavior
++
++- Reuse is serialized by internal endpoint. Randomized port allocation
++  still reuses that endpoint's existing fullcone binding.
++- Public endpoints are checked and published under their own bucket lock;
++  lookup, tuple copying and deletion use the same lock to prevent reads of
++  recycled conntracks. Source mapping reuse holds the source list lock.
++  A matching owner ends the reservation scan, including when many connections
++  share the endpoint. Ordinary SNAT also participates in the
++  reservation check, while retaining normal five-tuple sharing with other
++  ordinary SNAT flows.
++- Matching includes network namespace, both conntrack zone directions,
++  address family and transport protocol. A private conntrack flag marks
++  fullcone source bindings. DNAT only consults confirmed, non-dying marked
++  bindings. No userspace conntrack status bit is repurposed.
++- Allocation uses bounded attempts and drops on fullcone allocation
++  failure; it never evicts another fullcone binding to reuse its port.
++- Mappings remain tied to outbound conntracks. Once all outbound bindings
++  have been destroyed, new peers need a new outbound mapping; already
++  established inbound connections retain their own conntrack NAT state.
++
++The kernel implementation keeps established supported TCP/UDP flows eligible
++for normal flowtable and PPE offload; this build disables the firewall flowtable
++policy by default as described above. A new remote tuple misses those entries and reaches the
++software fullcone lookup. Lack of hardware wildcard fullcone entries is
++not, by itself, a reason to disable ordinary connection offload. Existing
++MTK/QCA/QCB driver limits (for example NAT66 or double NAT) still apply.
++
++Compile, rule-rendering and source-level concurrency checks do not replace
++router packet tests, Linux RCU/lockdep testing, or MTK/QCA/QCB PPE tests.
++
++## Regression checks
++
++The source-extraction, firewall-rule, LuCI staging and migration test tools are
++kept in the external validation archive rather than shipped in this package.
++They use prepared kernel/firewall sources and isolated host fixtures; they do
++not contact a router. The recorded checks cover endpoint isolation, bounded
++allocation, mixed NAT policies, concurrent retirement/reuse, compilation
++without fullcone state, all supported protocols, address restrictions, DNAT
++precedence, unavailable-kernel fallback, IPv4 masquerading coupling, IPv6
++independence and idempotent migration.
++
++Compile the affected target modules with the kernel option both on and off,
++and rebuild the firmware before deploying kernel changes. The validation
++archive contains the exact tool copies, source hashes and run logs for each
++release check.
+diff --git a/target/linux/generic/hack-6.18/984-add-sonic-fullcone-support.patch b/target/linux/generic/hack-6.18/984-add-sonic-fullcone-support.patch
+new file mode 100644
+index 0000000000..6f133574d3
+--- /dev/null
++++ b/target/linux/generic/hack-6.18/984-add-sonic-fullcone-support.patch
+@@ -0,0 +1,660 @@
++From: Akhilesh Samineni <akhilesh.samineni@broadcom.com>
++Subject: [PATCH] netfilter: add SONiC fullcone NAT with isolated reservations
++
++Based on SONiC fullcone NAT and openwrt-sonic-fullcone revision
++4de0643f6b48e7e7d57d768144204ce5d3078c8f. Use conntrack-owned bindings,
++not an xtables mapping table or a separate garbage collection worker.
++
++Serialize fullcone mapping reuse by internal endpoint. Check and publish
++translated endpoints under the translated bucket lock, also used for
++removal. Ordinary NAT participates in reservations but is never exposed
++by fullcone DNAT. Include network namespace, both zone directions and
++address family in matching. Only confirmed live fullcone bindings may
++receive new inbound peers; existing flows retain normal flowtable/PPE
++eligibility. Retry competing reservations with a bounded allocation cost
++and drop instead of replacing a live mapping.
++
++Keep ordinary NAT allocator fallback behavior. Fullcone is limited to
++TCP, UDP, UDP-Lite and SCTP; other protocols and helper-managed flows
++retain ordinary NAT semantics. Mapping lifetime follows outbound
++conntracks, including references held by flowtable offload.
++
++Protect source reuse, inbound lookup and reservation checks against object
++recycling with their list bucket locks. A matching endpoint owner suffices
++to decide sharing; compile out all added state when fullcone is disabled.
++
++Signed-off-by: Akhilesh Samineni <akhilesh.samineni@broadcom.com>
++
++--- a/include/net/netfilter/nf_conntrack.h
+++++ b/include/net/netfilter/nf_conntrack.h
++@@ -101,9 +101,18 @@ struct nf_conn {
++ 
++ #if IS_ENABLED(CONFIG_NF_NAT)
++ 	struct hlist_node	nat_bysource;
+++
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	/* To optionally ensure 3-tuple uniqueness on the translated source */
+++	struct hlist_node	nat_by_manip_src;
+++#endif
++ #endif
++ 	/* all members below initialized via memset */
++ 	struct { } __nfct_init_offset;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	/* Published with nat_by_manip_src; never inferred from ordinary SNAT. */
+++	bool nat_fullcone;
+++#endif
++ 
++ 	/* If we were expected by an expectation, this will be it */
++ 	struct nf_conn *master;
++--- a/include/uapi/linux/netfilter/nf_nat.h
+++++ b/include/uapi/linux/netfilter/nf_nat.h
++@@ -12,6 +12,7 @@
++ #define NF_NAT_RANGE_PROTO_RANDOM_FULLY		(1 << 4)
++ #define NF_NAT_RANGE_PROTO_OFFSET		(1 << 5)
++ #define NF_NAT_RANGE_NETMAP			(1 << 6)
+++#define NF_NAT_RANGE_FULLCONE			(1 << 10)
++ 
++ #define NF_NAT_RANGE_PROTO_RANDOM_ALL		\
++ 	(NF_NAT_RANGE_PROTO_RANDOM | NF_NAT_RANGE_PROTO_RANDOM_FULLY)
++@@ -20,7 +21,7 @@
++ 	(NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED |	\
++ 	 NF_NAT_RANGE_PROTO_RANDOM | NF_NAT_RANGE_PERSISTENT |	\
++ 	 NF_NAT_RANGE_PROTO_RANDOM_FULLY | NF_NAT_RANGE_PROTO_OFFSET | \
++-	 NF_NAT_RANGE_NETMAP)
+++	 NF_NAT_RANGE_NETMAP | NF_NAT_RANGE_FULLCONE)
++ 
++ struct nf_nat_ipv4_range {
++ 	unsigned int			flags;
++--- a/net/netfilter/nf_nat_core.c
+++++ b/net/netfilter/nf_nat_core.c
++@@ -31,11 +31,20 @@
++ #define NF_NAT_HARDER_THRESH	(NF_NAT_MAX_ATTEMPTS / 4)
++ 
++ static spinlock_t nf_nat_locks[CONNTRACK_LOCKS];
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++/* Serialize mapping reuse by internal endpoint, separately from list writers. */
+++static spinlock_t nf_nat_fullcone_locks[CONNTRACK_LOCKS];
+++/* Protect translated-source buckets, including check-and-publish. */
+++static spinlock_t nf_nat_manip_src_locks[CONNTRACK_LOCKS];
+++#endif
++ 
++ static DEFINE_MUTEX(nf_nat_proto_mutex);
++ static unsigned int nat_net_id __read_mostly;
++ 
++ static struct hlist_head *nf_nat_bysource __read_mostly;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++static struct hlist_head *nf_nat_by_manip_src __read_mostly;
+++#endif
++ static unsigned int nf_nat_htable_size __read_mostly;
++ static siphash_aligned_key_t nf_nat_hash_rnd;
++ 
++@@ -179,6 +188,102 @@ hash_by_src(const struct net *net,
++ 	return reciprocal_scale(hash, nf_nat_htable_size);
++ }
++ 
+++static bool nf_nat_is_fullcone(const struct nf_conn *ct)
+++{
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	return ct->nat_fullcone;
+++#else
+++	return false;
+++#endif
+++}
+++
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++static bool
+++same_source_endpoint(const struct nf_conntrack_tuple *a,
+++		     const struct nf_conntrack_tuple *b)
+++{
+++	return a->src.l3num == b->src.l3num &&
+++	       a->dst.protonum == b->dst.protonum &&
+++	       nf_inet_addr_cmp(&a->src.u3, &b->src.u3) &&
+++	       a->src.u.all == b->src.u.all;
+++}
+++
+++static bool
+++same_nat_zone(const struct nf_conn *ct,
+++	      const struct nf_conntrack_zone *zone)
+++{
+++	return nf_ct_zone_equal(ct, zone, IP_CT_DIR_ORIGINAL) &&
+++	       nf_ct_zone_equal(ct, zone, IP_CT_DIR_REPLY);
+++}
+++
+++static bool
+++same_reply_dst(const struct nf_conn *ct,
+++	       const struct nf_conntrack_tuple *tuple)
+++{
+++	const struct nf_conntrack_tuple *t =
+++		&ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+++
+++	return t->src.l3num == tuple->src.l3num &&
+++	       t->dst.protonum == tuple->dst.protonum &&
+++	       nf_inet_addr_cmp(&t->dst.u3, &tuple->dst.u3) &&
+++	       t->dst.u.all == tuple->dst.u.all;
+++}
+++
+++/* Ordinary NAT bindings reserve their endpoint against fullcone too.
+++ * Only fullcone bindings belonging to the same internal endpoint may share
+++ * a public endpoint. Ordinary NAT keeps its usual five-tuple sharing.
+++ * The translated bucket lock protects both object lifetime and ownership.
+++ * A matching owner determines the policy for every binding of this endpoint.
+++ */
+++static bool
+++__nf_nat_used_3_tuple(const struct nf_conntrack_tuple *tuple,
+++		    const struct nf_conn *ignored_conntrack)
+++{
+++	const struct nf_conntrack_zone *zone = nf_ct_zone(ignored_conntrack);
+++	struct net *net = nf_ct_net(ignored_conntrack);
+++	struct nf_conntrack_tuple reply;
+++	const struct nf_conn *ct;
+++	unsigned int h;
+++
+++	nf_ct_invert_tuple(&reply, tuple);
+++	h = hash_by_src(net, zone, tuple);
+++	lockdep_assert_held(&nf_nat_manip_src_locks[h % CONNTRACK_LOCKS]);
+++	hlist_for_each_entry_rcu(ct, &nf_nat_by_manip_src[h], nat_by_manip_src) {
+++		if (ct == ignored_conntrack || !same_reply_dst(ct, &reply) ||
+++		    !net_eq(net, nf_ct_net(ct)) || !same_nat_zone(ct, zone))
+++			continue;
+++
+++		if (!ct->nat_fullcone && !ignored_conntrack->nat_fullcone)
+++			return false;
+++		if (ct->nat_fullcone && ignored_conntrack->nat_fullcone &&
+++		    same_source_endpoint(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+++			&ignored_conntrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple))
+++			return false;
+++		return true;
+++	}
+++	return false;
+++}
+++#endif
+++
+++static bool
+++nf_nat_used_3_tuple(const struct nf_conntrack_tuple *tuple,
+++		    const struct nf_conn *ct)
+++{
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	unsigned int h = hash_by_src(nf_ct_net(ct), nf_ct_zone(ct), tuple);
+++	spinlock_t *lock = &nf_nat_manip_src_locks[h % CONNTRACK_LOCKS];
+++	bool used;
+++
+++	spin_lock_bh(lock);
+++	used = __nf_nat_used_3_tuple(tuple, ct);
+++	spin_unlock_bh(lock);
+++	return used;
+++#else
+++	return false;
+++#endif
+++}
+++
+++
++ /**
++  * nf_nat_used_tuple - check if proposed nat tuple clashes with existing entry
++  * @tuple: proposed NAT binding
++@@ -471,22 +576,79 @@ find_appropriate_src(struct net *net,
++ {
++ 	unsigned int h = hash_by_src(net, zone, tuple);
++ 	const struct nf_conn *ct;
+++	int found = 0;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	spinlock_t *lock = &nf_nat_locks[h % CONNTRACK_LOCKS];
+++
+++	spin_lock_bh(lock);
+++#endif
++ 
++ 	hlist_for_each_entry_rcu(ct, &nf_nat_bysource[h], nat_bysource) {
++-		if (same_src(ct, tuple) &&
+++		if (!!(range->flags & NF_NAT_RANGE_FULLCONE) != nf_nat_is_fullcone(ct))
+++			continue;
+++		if (nf_ct_is_dying(ct))
+++			continue;
+++		if (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num == tuple->src.l3num &&
+++		    same_src(ct, tuple) &&
++ 		    net_eq(net, nf_ct_net(ct)) &&
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++		    same_nat_zone(ct, zone)) {
+++#else
++ 		    nf_ct_zone_equal(ct, zone, IP_CT_DIR_ORIGINAL)) {
+++#endif
++ 			/* Copy source part from reply tuple. */
++ 			nf_ct_invert_tuple(result,
++ 				       &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
++ 			result->dst = tuple->dst;
++ 
++-			if (nf_in_range(result, range))
++-				return 1;
+++			if (nf_in_range(result, range)) {
+++				found = 1;
+++				break;
+++			}
++ 		}
++ 	}
++-	return 0;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	spin_unlock_bh(lock);
+++#endif
+++	return found;
+++}
+++
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++/* Only called for DST manip */
+++static int
+++find_appropriate_dst(struct net *net,
+++		     const struct nf_conntrack_zone *zone,
+++		     const struct nf_conntrack_tuple *tuple,
+++		     struct nf_conntrack_tuple *result)
+++{
+++	struct nf_conntrack_tuple reply;
+++	unsigned int h;
+++	spinlock_t *lock;
+++	int found = 0;
+++	const struct nf_conn *ct;
+++
+++	nf_ct_invert_tuple(&reply, tuple);
+++	h = hash_by_src(net, zone, &reply);
+++	lock = &nf_nat_manip_src_locks[h % CONNTRACK_LOCKS];
+++	spin_lock_bh(lock);
+++
+++	hlist_for_each_entry_rcu(ct, &nf_nat_by_manip_src[h], nat_by_manip_src) {
+++		if (ct->nat_fullcone && nf_ct_is_confirmed(ct) &&
+++		    !nf_ct_is_dying(ct) && same_reply_dst(ct, tuple) &&
+++		    net_eq(net, nf_ct_net(ct)) &&
+++		    same_nat_zone(ct, zone)) {
+++			/* Copy destination part from original tuple. */
+++			nf_ct_invert_tuple(result,
+++					   &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
+++			result->src = tuple->src;
+++			found = 1;
+++			break;
+++		}
+++	}
+++	spin_unlock_bh(lock);
+++	return found;
++ }
+++#endif
++ 
++ /* For [FUTURE] fragmentation handling, we want the least-used
++  * src-ip/dst-ip/proto triple.  Fairness doesn't come into it.  Thus
++@@ -567,7 +729,7 @@ find_best_ips_proto(const struct nf_conn
++  *
++  * Per-protocol part of tuple is initialized to the incoming packet.
++  */
++-static void nf_nat_l4proto_unique_tuple(struct nf_conntrack_tuple *tuple,
+++static bool nf_nat_l4proto_unique_tuple(struct nf_conntrack_tuple *tuple,
++ 					const struct nf_nat_range2 *range,
++ 					enum nf_nat_manip_type maniptype,
++ 					const struct nf_conn *ct)
++@@ -595,7 +757,7 @@ static void nf_nat_l4proto_unique_tuple(
++ 		/* If there is no master conntrack we are not PPTP,
++ 		   do not change tuples */
++ 		if (!ct->master)
++-			return;
+++			return true;
++ 
++ 		if (maniptype == NF_NAT_MANIP_SRC)
++ 			keyptr = &tuple->src.u.gre.key;
++@@ -622,14 +784,14 @@ static void nf_nat_l4proto_unique_tuple(
++ 
++ 		break;
++ 	default:
++-		return;
+++		return true;
++ 	}
++ 
++ 	/* If no range specified... */
++ 	if (!(range->flags & NF_NAT_RANGE_PROTO_SPECIFIED)) {
++ 		/* If it's dst rewrite, can't change port */
++ 		if (maniptype == NF_NAT_MANIP_DST)
++-			return;
+++			return true;
++ 
++ 		if (ntohs(*keyptr) < 1024) {
++ 			/* Loose convention: >> 512 is credential passing */
++@@ -674,12 +836,19 @@ find_free_id:
++ another_round:
++ 	for (i = 0; i < attempts; i++, off++) {
++ 		*keyptr = htons(min + off % range_size);
++-		if (!nf_nat_used_tuple_harder(tuple, ct, attempts - i))
++-			return;
+++		if (maniptype == NF_NAT_MANIP_SRC &&
+++		    nf_nat_used_3_tuple(tuple, ct))
+++			continue;
+++		if (nf_nat_is_fullcone(ct)) {
+++			if (!nf_nat_used_tuple(tuple, ct))
+++				return true;
+++		} else if (!nf_nat_used_tuple_harder(tuple, ct, attempts - i)) {
+++			return true;
+++		}
++ 	}
++ 
++ 	if (attempts >= range_size || attempts < 16)
++-		return;
+++		return !nf_nat_is_fullcone(ct);
++ 	attempts /= 2;
++ 	off = get_random_u16();
++ 	goto another_round;
++@@ -691,7 +860,7 @@ another_round:
++  * range. It might not be possible to get a unique tuple, but we try.
++  * At worst (or if we race), we will end up with a final duplicate in
++  * __nf_conntrack_confirm and drop the packet. */
++-static void
+++static bool
++ get_unique_tuple(struct nf_conntrack_tuple *tuple,
++ 		 const struct nf_conntrack_tuple *orig_tuple,
++ 		 const struct nf_nat_range2 *range,
++@@ -703,6 +872,17 @@ get_unique_tuple(struct nf_conntrack_tup
++ 
++ 	zone = nf_ct_zone(ct);
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	if (maniptype == NF_NAT_MANIP_DST &&
+++	    (range->flags & NF_NAT_RANGE_FULLCONE)) {
+++		if (!find_appropriate_dst(net, zone, orig_tuple, tuple)) {
+++			*tuple = *orig_tuple;
+++			return true;
+++		}
+++		return !nf_nat_used_tuple(tuple, ct);
+++	}
+++#endif
+++
++ 	/* 1) If this srcip/proto/src-proto-part is currently mapped,
++ 	 * and that same mapping gives a unique tuple within the given
++ 	 * range, use that.
++@@ -712,18 +892,30 @@ get_unique_tuple(struct nf_conntrack_tup
++ 	 * manips not an issue.
++ 	 */
++ 	if (maniptype == NF_NAT_MANIP_SRC &&
++-	    !(range->flags & NF_NAT_RANGE_PROTO_RANDOM_ALL)) {
+++	    (nf_nat_is_fullcone(ct) || !(range->flags & NF_NAT_RANGE_PROTO_RANDOM_ALL))) {
+++		/* Even a randomized fullcone rule must reuse an existing mapping. */
+++		if (nf_nat_is_fullcone(ct) &&
+++		    find_appropriate_src(net, zone, orig_tuple, tuple, range))
+++			return !nf_nat_used_3_tuple(tuple, ct) &&
+++			       !nf_nat_used_tuple(tuple, ct);
+++
++ 		/* try the original tuple first */
++ 		if (nf_in_range(orig_tuple, range)) {
++-			if (!nf_nat_used_tuple_new(orig_tuple, ct)) {
+++			if (!nf_nat_used_3_tuple(orig_tuple, ct) &&
+++			    !nf_nat_used_tuple_new(orig_tuple, ct)) {
++ 				*tuple = *orig_tuple;
++-				return;
+++				return true;
++ 			}
++ 		} else if (find_appropriate_src(net, zone,
++ 						orig_tuple, tuple, range)) {
++ 			pr_debug("get_unique_tuple: Found current src map\n");
++-			if (!nf_nat_used_tuple(tuple, ct))
++-				return;
+++			if (!nf_nat_used_3_tuple(tuple, ct)) {
+++				if (!nf_nat_used_tuple(tuple, ct))
+++					return true;
+++				/* A duplicate flow must not split a fullcone mapping. */
+++				if (nf_nat_is_fullcone(ct))
+++					return false;
+++			}
++ 		}
++ 	}
++ 
++@@ -736,7 +928,8 @@ get_unique_tuple(struct nf_conntrack_tup
++ 	 */
++ 
++ 	/* Only bother mapping if it's not already in range and unique */
++-	if (!(range->flags & NF_NAT_RANGE_PROTO_RANDOM_ALL)) {
+++	if (!(range->flags & NF_NAT_RANGE_PROTO_RANDOM_ALL) &&
+++	    (maniptype != NF_NAT_MANIP_SRC || !nf_nat_used_3_tuple(tuple, ct))) {
++ 		if (range->flags & NF_NAT_RANGE_PROTO_SPECIFIED) {
++ 			if (!(range->flags & NF_NAT_RANGE_PROTO_OFFSET) &&
++ 			    l4proto_in_range(tuple, maniptype,
++@@ -744,14 +937,14 @@ get_unique_tuple(struct nf_conntrack_tup
++ 					     &range->max_proto) &&
++ 			    (range->min_proto.all == range->max_proto.all ||
++ 			     !nf_nat_used_tuple(tuple, ct)))
++-				return;
+++				return true;
++ 		} else if (!nf_nat_used_tuple(tuple, ct)) {
++-			return;
+++			return true;
++ 		}
++ 	}
++ 
++ 	/* Last chance: get protocol to try to obtain unique tuple. */
++-	nf_nat_l4proto_unique_tuple(tuple, range, maniptype, ct);
+++	return nf_nat_l4proto_unique_tuple(tuple, range, maniptype, ct);
++ }
++ 
++ struct nf_conn_nat *nf_ct_nat_ext_add(struct nf_conn *ct)
++@@ -767,13 +960,18 @@ struct nf_conn_nat *nf_ct_nat_ext_add(st
++ }
++ EXPORT_SYMBOL_GPL(nf_ct_nat_ext_add);
++ 
++-unsigned int
++-nf_nat_setup_info(struct nf_conn *ct,
+++static unsigned int
+++__nf_nat_setup_info(struct nf_conn *ct,
++ 		  const struct nf_nat_range2 *range,
++ 		  enum nf_nat_manip_type maniptype)
++ {
++ 	struct net *net = nf_ct_net(ct);
++ 	struct nf_conntrack_tuple curr_tuple, new_tuple;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	struct nf_nat_range2 retry_range = *range;
+++	spinlock_t *manip_lock = NULL;
+++	unsigned int manip_src_hash = 0, retries = 0;
+++#endif
++ 
++ 	/* Can't setup nat info for confirmed ct. */
++ 	if (nf_ct_is_confirmed(ct))
++@@ -793,7 +991,31 @@ nf_nat_setup_info(struct nf_conn *ct,
++ 	nf_ct_invert_tuple(&curr_tuple,
++ 			   &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++retry:
+++	if (!get_unique_tuple(&new_tuple, &curr_tuple, &retry_range, ct, maniptype))
+++		return NF_DROP;
+++
+++	/* Port selection is only advisory until the bucket is locked. Both
+++	 * ordinary SNAT and fullcone publish here, so neither can race a
+++	 * reservation into the other policy's public endpoint.
+++	 */
+++	if (maniptype == NF_NAT_MANIP_SRC) {
+++		manip_src_hash = hash_by_src(net, nf_ct_zone(ct), &new_tuple);
+++		manip_lock = &nf_nat_manip_src_locks[manip_src_hash % CONNTRACK_LOCKS];
+++		spin_lock_bh(manip_lock);
+++		if (__nf_nat_used_3_tuple(&new_tuple, ct)) {
+++			spin_unlock_bh(manip_lock);
+++			if (++retries == 8)
+++				return NF_DROP;
+++			retry_range.flags |= NF_NAT_RANGE_PROTO_RANDOM_FULLY;
+++			goto retry;
+++		}
+++	}
+++
+++#else
++ 	get_unique_tuple(&new_tuple, &curr_tuple, range, ct, maniptype);
+++#endif
++ 
++ 	if (!nf_ct_tuple_equal(&new_tuple, &curr_tuple)) {
++ 		struct nf_conntrack_tuple reply;
++@@ -809,14 +1031,25 @@ nf_nat_setup_info(struct nf_conn *ct,
++ 			ct->status |= IPS_DST_NAT;
++ 
++ 		if (nfct_help(ct) && !nfct_seqadj(ct))
++-			if (!nfct_seqadj_ext_add(ct))
+++			if (!nfct_seqadj_ext_add(ct)) {
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++				if (manip_lock)
+++					spin_unlock_bh(manip_lock);
+++#endif
++ 				return NF_DROP;
+++			}
++ 	}
++ 
++ 	if (maniptype == NF_NAT_MANIP_SRC) {
++ 		unsigned int srchash;
++ 		spinlock_t *lock;
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++		hlist_add_head_rcu(&ct->nat_by_manip_src,
+++				   &nf_nat_by_manip_src[manip_src_hash]);
+++		spin_unlock_bh(manip_lock);
+++#endif
+++
++ 		srchash = hash_by_src(net, nf_ct_zone(ct),
++ 				      &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
++ 		lock = &nf_nat_locks[srchash % CONNTRACK_LOCKS];
++@@ -834,6 +1067,68 @@ nf_nat_setup_info(struct nf_conn *ct,
++ 
++ 	return NF_ACCEPT;
++ }
+++/* Only port-based conntrack protocols have a reversible fullcone key.
+++ * ICMP ids live in a different tuple field and GRE keys need their helper;
+++ * do not advertise fullcone semantics for those protocols.
+++ */
+++static bool nf_nat_fullcone_supported(const struct nf_conn *ct)
+++{
+++	if (!IS_ENABLED(CONFIG_NF_NAT_FULLCONE) || ct->master || nfct_help(ct))
+++		return false;
+++
+++	switch (nf_ct_protonum(ct)) {
+++	case IPPROTO_TCP:
+++	case IPPROTO_UDP:
+++#if IS_ENABLED(CONFIG_NF_CT_PROTO_UDPLITE)
+++	case IPPROTO_UDPLITE:
+++#endif
+++#if IS_ENABLED(CONFIG_NF_CT_PROTO_SCTP)
+++	case IPPROTO_SCTP:
+++#endif
+++		return true;
+++	default:
+++		return false;
+++	}
+++}
+++
+++unsigned int
+++nf_nat_setup_info(struct nf_conn *ct,
+++		  const struct nf_nat_range2 *range,
+++		  enum nf_nat_manip_type maniptype)
+++{
+++	struct nf_nat_range2 filtered_range = *range;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	spinlock_t *lock = NULL;
+++	unsigned int ret, h;
+++#endif
+++
+++	if (nf_ct_is_confirmed(ct))
+++		return NF_ACCEPT;
+++	if (WARN_ON(nf_nat_initialized(ct, maniptype)))
+++		return NF_DROP;
+++
+++	if (!nf_nat_fullcone_supported(ct))
+++		filtered_range.flags &= ~NF_NAT_RANGE_FULLCONE;
+++
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	if (maniptype == NF_NAT_MANIP_SRC) {
+++		ct->nat_fullcone = !!(filtered_range.flags & NF_NAT_RANGE_FULLCONE);
+++		if (ct->nat_fullcone) {
+++			h = hash_by_src(nf_ct_net(ct), nf_ct_zone(ct),
+++					&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
+++			lock = &nf_nat_fullcone_locks[h % CONNTRACK_LOCKS];
+++			spin_lock_bh(lock);
+++		}
+++	}
+++
+++	ret = __nf_nat_setup_info(ct, &filtered_range, maniptype);
+++	if (lock)
+++		spin_unlock_bh(lock);
+++	return ret;
+++#else
+++	return __nf_nat_setup_info(ct, &filtered_range, maniptype);
+++#endif
+++}
++ EXPORT_SYMBOL(nf_nat_setup_info);
++ 
++ static unsigned int
++@@ -995,6 +1290,15 @@ static int nf_nat_proto_remove(struct nf
++ static void nf_nat_cleanup_conntrack(struct nf_conn *ct)
++ {
++ 	unsigned int h;
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	struct nf_conntrack_tuple tuple;
+++
+++	nf_ct_invert_tuple(&tuple, &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
+++	h = hash_by_src(nf_ct_net(ct), nf_ct_zone(ct), &tuple);
+++	spin_lock_bh(&nf_nat_manip_src_locks[h % CONNTRACK_LOCKS]);
+++	hlist_del_rcu(&ct->nat_by_manip_src);
+++	spin_unlock_bh(&nf_nat_manip_src_locks[h % CONNTRACK_LOCKS]);
+++#endif
++ 
++ 	h = hash_by_src(nf_ct_net(ct), nf_ct_zone(ct), &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
++ 	spin_lock_bh(&nf_nat_locks[h % CONNTRACK_LOCKS]);
++@@ -1338,12 +1642,28 @@ static int __init nf_nat_init(void)
++ 	if (!nf_nat_bysource)
++ 		return -ENOMEM;
++ 
++-	for (i = 0; i < CONNTRACK_LOCKS; i++)
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	nf_nat_by_manip_src = nf_ct_alloc_hashtable(&nf_nat_htable_size, 0);
+++	if (!nf_nat_by_manip_src) {
+++		kvfree(nf_nat_bysource);
+++		return -ENOMEM;
+++	}
+++
+++#endif
+++	for (i = 0; i < CONNTRACK_LOCKS; i++) {
++ 		spin_lock_init(&nf_nat_locks[i]);
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++		spin_lock_init(&nf_nat_fullcone_locks[i]);
+++		spin_lock_init(&nf_nat_manip_src_locks[i]);
+++#endif
+++	}
++ 
++ 	ret = register_pernet_subsys(&nat_net_ops);
++ 	if (ret < 0) {
++ 		kvfree(nf_nat_bysource);
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++		kvfree(nf_nat_by_manip_src);
+++#endif
++ 		return ret;
++ 	}
++ 
++@@ -1360,6 +1680,9 @@ static int __init nf_nat_init(void)
++ 		nf_ct_helper_expectfn_destroy(&follow_master_nat);
++ 		unregister_pernet_subsys(&nat_net_ops);
++ 		kvfree(nf_nat_bysource);
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++		kvfree(nf_nat_by_manip_src);
+++#endif
++ 	}
++ 
++ 	return ret;
++@@ -1377,6 +1700,9 @@ static void __exit nf_nat_cleanup(void)
++ 	synchronize_net();
++ 	nf_ct_helper_expectfn_destroy(&follow_master_nat);
++ 	kvfree(nf_nat_bysource);
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	kvfree(nf_nat_by_manip_src);
+++#endif
++ 	unregister_pernet_subsys(&nat_net_ops);
++ }
++ 
++--- a/net/netfilter/Kconfig
+++++ b/net/netfilter/Kconfig
++@@ -423,6 +423,16 @@ config NF_NAT
++ 	  forms of full Network Address Port Translation. This can be
++ 	  controlled by iptables, ip6tables or nft.
++ 
+++config NF_NAT_FULLCONE
+++	bool "SONiC fullcone NAT"
+++	depends on NF_NAT
+++	default n
+++	help
+++	  Enable the FULLCONE iptables target and fullcone nftables expression
+++	  in the masquerade modules, using the shared SONiC NAT core.
+++	  Disabling this removes the extra endpoint table, nodes and locks.
+++	  Selected by the fullconenat-sonic package.
+++
++ config NF_NAT_AMANDA
++ 	tristate
++ 	depends on NF_CONNTRACK && NF_NAT
+diff --git a/target/linux/generic/hack-6.18/985-add-sonic-fullcone-to-ipt.patch b/target/linux/generic/hack-6.18/985-add-sonic-fullcone-to-ipt.patch
+new file mode 100644
+index 0000000000..1b159861a4
+--- /dev/null
++++ b/target/linux/generic/hack-6.18/985-add-sonic-fullcone-to-ipt.patch
+@@ -0,0 +1,138 @@
++From: openwrt-sonic-fullcone contributors
++Subject: [PATCH] netfilter: add SONiC FULLCONE target to xt_MASQUERADE
++
++Support IPv4 and IPv6 PREROUTING/POSTROUTING using the shared NAT core.
++Reuse masquerade argument validation and add module aliases. Gate target
++registration with the SONiC build option. Refreshed for Linux 6.18.
++
++--- a/net/netfilter/xt_MASQUERADE.c
+++++ b/net/netfilter/xt_MASQUERADE.c
++@@ -8,8 +8,10 @@
++ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++ #include <linux/module.h>
++ #include <linux/netfilter/x_tables.h>
+++#include <net/netfilter/nf_conntrack.h>
++ #include <net/netfilter/nf_nat.h>
++ #include <net/netfilter/nf_nat_masquerade.h>
+++#include <uapi/linux/netfilter/nf_nat.h>
++ 
++ MODULE_LICENSE("GPL");
++ MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
++@@ -69,6 +71,69 @@ static int masquerade_tg6_checkentry(con
++ }
++ #endif
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++/* SONiC fullcone target: allows both PRE- and POST-routing hooks.
+++ * POSTROUTING: regular masquerade with NF_NAT_RANGE_FULLCONE flag
+++ *              (3-tuple unique mapping via 984 patch).
+++ * PREROUTING:  reverse lookup via find_appropriate_dst() in
+++ *              nf_nat_setup_info() with NF_NAT_MANIP_DST.
+++ */
+++static unsigned int
+++fullcone_tg(struct sk_buff *skb, const struct xt_action_param *par)
+++{
+++	const struct nf_nat_ipv4_multi_range_compat *mr = par->targinfo;
+++	struct nf_nat_range2 range;
+++	struct nf_conn *ct;
+++	enum ip_conntrack_info ctinfo;
+++
+++	memset(&range, 0, sizeof(range));
+++	range.flags      = mr->range[0].flags | NF_NAT_RANGE_FULLCONE;
+++	range.min_proto  = mr->range[0].min;
+++	range.max_proto  = mr->range[0].max;
+++
+++	if (xt_hooknum(par) == NF_INET_POST_ROUTING)
+++		return nf_nat_masquerade_ipv4(skb, xt_hooknum(par), &range,
+++					      xt_out(par));
+++
+++	/* PREROUTING: reverse mapping for EIF */
+++	ct = nf_ct_get(skb, &ctinfo);
+++	if (!ct || (ctinfo != IP_CT_NEW && ctinfo != IP_CT_RELATED &&
+++		    ctinfo != IP_CT_RELATED_REPLY))
+++		return NF_ACCEPT;
+++
+++	return nf_nat_setup_info(ct, &range, NF_NAT_MANIP_DST);
+++}
+++
+++#if IS_ENABLED(CONFIG_IPV6)
+++static unsigned int
+++fullcone_tg6(struct sk_buff *skb, const struct xt_action_param *par)
+++{
+++	const struct nf_nat_range *orig = par->targinfo;
+++	struct nf_nat_range2 range;
+++	struct nf_conn *ct;
+++	enum ip_conntrack_info ctinfo;
+++
+++	memset(&range, 0, sizeof(range));
+++	range.flags      = orig->flags | NF_NAT_RANGE_FULLCONE;
+++	range.min_addr   = orig->min_addr;
+++	range.max_addr   = orig->max_addr;
+++	range.min_proto  = orig->min_proto;
+++	range.max_proto  = orig->max_proto;
+++
+++	if (xt_hooknum(par) == NF_INET_POST_ROUTING)
+++		return nf_nat_masquerade_ipv6(skb, &range, xt_out(par));
+++
+++	ct = nf_ct_get(skb, &ctinfo);
+++	if (!ct || (ctinfo != IP_CT_NEW && ctinfo != IP_CT_RELATED &&
+++		    ctinfo != IP_CT_RELATED_REPLY))
+++		return NF_ACCEPT;
+++
+++	return nf_nat_setup_info(ct, &range, NF_NAT_MANIP_DST);
+++}
+++#endif
+++
+++#endif /* CONFIG_NF_NAT_FULLCONE */
+++
++ static struct xt_target masquerade_tg_reg[] __read_mostly = {
++ 	{
++ #if IS_ENABLED(CONFIG_IPV6)
++@@ -92,7 +157,35 @@ static struct xt_target masquerade_tg_re
++ 		.checkentry	= masquerade_tg_check,
++ 		.destroy	= masquerade_tg_destroy,
++ 		.me		= THIS_MODULE,
++-	}
+++	},
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	{
+++		.name		= "FULLCONE",
+++		.family		= NFPROTO_IPV4,
+++		.target		= fullcone_tg,
+++		.targetsize	= sizeof(struct nf_nat_ipv4_multi_range_compat),
+++		.table		= "nat",
+++		.hooks		= (1 << NF_INET_PRE_ROUTING) |
+++				  (1 << NF_INET_POST_ROUTING),
+++		.checkentry	= masquerade_tg_check,
+++		.destroy	= masquerade_tg_destroy,
+++		.me		= THIS_MODULE,
+++	},
+++#if IS_ENABLED(CONFIG_IPV6)
+++	{
+++		.name		= "FULLCONE",
+++		.family		= NFPROTO_IPV6,
+++		.target		= fullcone_tg6,
+++		.targetsize	= sizeof(struct nf_nat_range),
+++		.table		= "nat",
+++		.hooks		= (1 << NF_INET_PRE_ROUTING) |
+++				  (1 << NF_INET_POST_ROUTING),
+++		.checkentry	= masquerade_tg6_checkentry,
+++		.destroy	= masquerade_tg_destroy,
+++		.me		= THIS_MODULE,
+++	},
+++#endif
+++#endif /* CONFIG_NF_NAT_FULLCONE */
++ };
++ 
++ static int __init masquerade_tg_init(void)
++@@ -126,3 +219,10 @@ module_exit(masquerade_tg_exit);
++ MODULE_ALIAS("ip6t_MASQUERADE");
++ #endif
++ MODULE_ALIAS("ipt_MASQUERADE");
+++
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++MODULE_ALIAS("ipt_FULLCONE");
+++#if IS_ENABLED(CONFIG_IPV6)
+++MODULE_ALIAS("ip6t_FULLCONE");
+++#endif
+++#endif
+diff --git a/target/linux/generic/hack-6.18/986-add-sonic-fullcone-to-nft.patch b/target/linux/generic/hack-6.18/986-add-sonic-fullcone-to-nft.patch
+new file mode 100644
+index 0000000000..162ac9606f
+--- /dev/null
++++ b/target/linux/generic/hack-6.18/986-add-sonic-fullcone-to-nft.patch
+@@ -0,0 +1,198 @@
++From: openwrt-sonic-fullcone contributors
++Subject: [PATCH] netfilter: add SONiC fullcone expression to nft_masq
++
++Build with CONFIG_NF_NAT_FULLCONE selected by the SONiC package.
++Use the shared SONiC NAT core for both hooks in ip/ip6/inet NAT tables.
++Reject other families before acquiring conntrack references.
++Linux 6.18 has no reduce op.
++
++--- a/net/netfilter/nft_masq.c
+++++ b/net/netfilter/nft_masq.c
++@@ -12,6 +12,8 @@
++ #include <net/netfilter/nf_tables.h>
++ #include <net/netfilter/nf_nat.h>
++ #include <net/netfilter/nf_nat_masquerade.h>
+++#include <net/netfilter/nf_conntrack.h>
+++#include <uapi/linux/netfilter/nf_nat.h>
++ 
++ struct nft_masq {
++ 	u32			flags;
++@@ -128,6 +130,114 @@ static void nft_masq_eval(const struct n
++ 	}
++ }
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++/* SONiC fullcone expression — shares struct/init/dump with masq,
+++ * but allows prerouting hook and sets NF_NAT_RANGE_FULLCONE.
+++ */
+++
+++enum nft_fullcone_attributes {
+++	NFTA_FULLCONE_UNSPEC,
+++	NFTA_FULLCONE_FLAGS,
+++	NFTA_FULLCONE_REG_PROTO_MIN,
+++	NFTA_FULLCONE_REG_PROTO_MAX,
+++	__NFTA_FULLCONE_MAX
+++};
+++#define NFTA_FULLCONE_MAX	(__NFTA_FULLCONE_MAX - 1)
+++
+++static const struct nla_policy nft_fullcone_policy[NFTA_FULLCONE_MAX + 1] = {
+++	[NFTA_FULLCONE_FLAGS]		=
+++		NLA_POLICY_MASK(NLA_BE32, NF_NAT_RANGE_MASK),
+++	[NFTA_FULLCONE_REG_PROTO_MIN]	= { .type = NLA_U32 },
+++	[NFTA_FULLCONE_REG_PROTO_MAX]	= { .type = NLA_U32 },
+++};
+++
+++/* One shared expression for ip, ip6 and inet NAT tables. Other table
+++ * families must not acquire conntrack references through this frontend.
+++ */
+++static int nft_fullcone_init(const struct nft_ctx *ctx,
+++			     const struct nft_expr *expr,
+++			     const struct nlattr * const tb[])
+++{
+++	switch (ctx->family) {
+++	case NFPROTO_IPV4:
+++	case NFPROTO_IPV6:
+++	case NFPROTO_INET:
+++		return nft_masq_init(ctx, expr, tb);
+++	default:
+++		return -EOPNOTSUPP;
+++	}
+++}
+++
+++static int nft_fullcone_validate(const struct nft_ctx *ctx,
+++				 const struct nft_expr *expr)
+++{
+++	int err;
+++
+++	err = nft_chain_validate_dependency(ctx->chain, NFT_CHAIN_T_NAT);
+++	if (err < 0)
+++		return err;
+++
+++	return nft_chain_validate_hooks(ctx->chain,
+++			(1 << NF_INET_PRE_ROUTING) |
+++			(1 << NF_INET_POST_ROUTING));
+++}
+++
+++static void nft_fullcone_eval(const struct nft_expr *expr,
+++			      struct nft_regs *regs,
+++			      const struct nft_pktinfo *pkt)
+++{
+++	const struct nft_masq *priv = nft_expr_priv(expr);
+++	struct nf_nat_range2 range;
+++	enum nf_nat_manip_type mtype = HOOK2MANIP(nft_hook(pkt));
+++
+++	memset(&range, 0, sizeof(range));
+++	range.flags = priv->flags | NF_NAT_RANGE_FULLCONE;
+++
+++	if (priv->sreg_proto_min) {
+++		range.min_proto.all = (__force __be16)
+++			nft_reg_load16(&regs->data[priv->sreg_proto_min]);
+++		range.max_proto.all = (__force __be16)
+++			nft_reg_load16(&regs->data[priv->sreg_proto_max]);
+++	}
+++
+++	if (mtype == NF_NAT_MANIP_SRC) {
+++		switch (nft_pf(pkt)) {
+++		case NFPROTO_IPV4:
+++			regs->verdict.code = nf_nat_masquerade_ipv4(pkt->skb,
+++					nft_hook(pkt), &range, nft_out(pkt));
+++			break;
+++#ifdef CONFIG_NF_TABLES_IPV6
+++		case NFPROTO_IPV6:
+++			regs->verdict.code = nf_nat_masquerade_ipv6(pkt->skb,
+++					&range, nft_out(pkt));
+++			break;
+++#endif
+++		default:
+++			break;
+++		}
+++	} else {
+++		struct nf_conn *ct;
+++		enum ip_conntrack_info ctinfo;
+++
+++		ct = nf_ct_get(pkt->skb, &ctinfo);
+++		if (!ct || (ctinfo != IP_CT_NEW && ctinfo != IP_CT_RELATED &&
+++			    ctinfo != IP_CT_RELATED_REPLY)) {
+++			regs->verdict.code = NF_ACCEPT;
+++			return;
+++		}
+++		regs->verdict.code = nf_nat_setup_info(ct, &range,
+++						       NF_NAT_MANIP_DST);
+++	}
+++}
+++
+++static void
+++nft_fullcone_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
+++{
+++	nf_ct_netns_put(ctx->net, ctx->family);
+++}
+++
+++#endif /* CONFIG_NF_NAT_FULLCONE */
+++
++ static void
++ nft_masq_ipv4_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
++ {
++@@ -236,6 +346,29 @@ static inline int nft_masq_module_init_i
++ static inline void nft_masq_module_exit_inet(void) {}
++ #endif
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++static struct nft_expr_type nft_fullcone_type;
+++static const struct nft_expr_ops nft_fullcone_ops = {
+++	.type		= &nft_fullcone_type,
+++	.size		= NFT_EXPR_SIZE(sizeof(struct nft_masq)),
+++	.eval		= nft_fullcone_eval,
+++	.init		= nft_fullcone_init,
+++	.destroy	= nft_fullcone_destroy,
+++	.dump		= nft_masq_dump,
+++	.validate	= nft_fullcone_validate,
+++};
+++
+++static struct nft_expr_type nft_fullcone_type __read_mostly = {
+++	.family		= NFPROTO_UNSPEC,
+++	.name		= "fullcone",
+++	.ops		= &nft_fullcone_ops,
+++	.policy		= nft_fullcone_policy,
+++	.maxattr	= NFTA_FULLCONE_MAX,
+++	.owner		= THIS_MODULE,
+++};
+++
+++#endif /* CONFIG_NF_NAT_FULLCONE */
+++
++ static int __init nft_masq_module_init(void)
++ {
++ 	int ret;
++@@ -265,6 +398,15 @@ static int __init nft_masq_module_init(v
++ 		return ret;
++ 	}
++ 
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	ret = nft_register_expr(&nft_fullcone_type);
+++	if (ret < 0) {
+++		nf_nat_masquerade_inet_unregister_notifiers();
+++		nft_unregister_expr(&nft_masq_ipv4_type);
+++		nft_masq_module_exit_inet();
+++		nft_masq_module_exit_ipv6();
+++	}
+++#endif
++ 	return ret;
++ }
++ 
++@@ -273,11 +415,17 @@ static void __exit nft_masq_module_exit(
++ 	nft_masq_module_exit_ipv6();
++ 	nft_masq_module_exit_inet();
++ 	nft_unregister_expr(&nft_masq_ipv4_type);
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++	nft_unregister_expr(&nft_fullcone_type);
+++#endif
++ 	nf_nat_masquerade_inet_unregister_notifiers();
++ }
++ 
++ module_init(nft_masq_module_init);
++ module_exit(nft_masq_module_exit);
+++#if IS_ENABLED(CONFIG_NF_NAT_FULLCONE)
+++MODULE_ALIAS_NFT_EXPR("fullcone");
+++#endif
++ 
++ MODULE_LICENSE("GPL");
++ MODULE_AUTHOR("Arturo Borrero Gonzalez <arturo@debian.org>");
