@@ -1,1 +1,5 @@
-111
+CONFIG_TARGET_qualcommax=y
+CONFIG_TARGET_qualcommax_ipq807x=y
+CONFIG_TARGET_qualcommax_ipq807x_DEVICE_qhar-301w=y
+CONFIG_DEVEL=y
+CONFIG_CCACHE=y
