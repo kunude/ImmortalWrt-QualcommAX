@@ -16,6 +16,14 @@
       "source_ref": "nss-edma-custom",
       "passwall_tag": "passwall-nn6000",
       "release_tag_prefix": "nn6000-"
+    },
+    {
+      "target": "301w",
+      "name": "Qhora-301w (IPQ8074, 1GB RAM)",
+      "config": "301w",
+      "source_ref": "nss-edma-custom",
+      "passwall_tag": "passwall-301w",
+      "release_tag_prefix": "301w-"
     }
   ]
 }
