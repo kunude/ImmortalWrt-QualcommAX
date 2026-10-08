@@ -11,6 +11,7 @@ on:
         options:
           - 'rbr750'
           - 'nn6000'
+          - '301w'
           - 'both'
       release:
         description: '是否发布到 Release'
@@ -412,3 +413,4 @@ jobs:
 
           publish_target "rbr750"
           publish_target "nn6000"
+          publish_target "301w"
